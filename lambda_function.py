@@ -16,10 +16,12 @@ FIRSTDAY_OF_MONTH = YESTERDAY.replace(day=1)
 # main handler
 def lambda_handler(event, context):
     dailyReport = Report.transform_to_slack_field(
-        ce_services_report = CostExplorerQuery.group_by_service(granularity="DAILY"),
+        # ce_services_report = CostExplorerQuery.group_by_service(granularity="DAILY"),
+        ce_account_report  = CostExplorerQuery.group_by_account(granularity="DAILY"),
         ce_total_report    = CostExplorerQuery.total(granularity="DAILY"),)
     monthlyReport = Report.transform_to_slack_field(
-        ce_services_report = CostExplorerQuery.group_by_service(granularity="MONTHLY"),
+        # ce_services_report = CostExplorerQuery.group_by_service(granularity="MONTHLY"),
+        ce_account_report  = CostExplorerQuery.group_by_account(granularity="MONTHLY"),
         ce_total_report    = CostExplorerQuery.total(granularity="MONTHLY"),)
     # send to slack
     SlackBot.send_report(dailyReport, monthlyReport)
@@ -28,21 +30,22 @@ def lambda_handler(event, context):
 class Report:
 
     @staticmethod
-    def transform_to_slack_field(ce_services_report, ce_total_report):
+    def transform_to_slack_field(ce_account_report, ce_total_report):
         try:
             # parse cost from report
-            costPerService = {
-                group['Keys'][0]: float(group['Metrics']['UnblendedCost']['Amount'])
-                for group in ce_services_report['ResultsByTime'][0]['Groups']
+            accounts = Organizations.list_accounts()
+            costInfo = {
+                accounts[group['Keys'][0]]: float(group['Metrics']['UnblendedCost']['Amount'])
+                for group in ce_account_report['ResultsByTime'][0]['Groups']
                     if '0.00' != f"{float(group['Metrics']['UnblendedCost']['Amount']):.2f}"
             }
             # cost per service
             buffer = [
                 {
                     "title": key,
-                    "value": f"$ {costPerService[key]:.2f}"
+                    "value": f"$ {costInfo[key]:.2f}"
                 }
-                for key in sorted(costPerService, key=costPerService.get, reverse=True)
+                for key in sorted(costInfo, key=costInfo.get, reverse=True)
             ]
             # total cost
             buffer.insert(0,
@@ -75,7 +78,42 @@ class SlackBot:
                 "channel": "#aws-cost",
                 "username": "aws",
                 "icon_emoji": ":aws:",
-                "text": "cost explorer: https://console.aws.amazon.com/cost-management/home#",
+                "blocks": [
+                    {
+                        "type": "header",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "AWS Cost Report",
+                            "emoji": True
+                        }
+                    },
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "The summary of cost and usage per account in yesterday and this month.",
+                            "emoji": True
+                        }
+                    },
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "For more detail, see cost explorer within organizations root account."
+                        },
+                        "accessory": {
+                            "type": "button",
+                            "text": {
+                                "type": "plain_text",
+                                "text": "Go to cost explorer",
+                                "emoji": True
+                            },
+                            "value": "click_me_123",
+                            "url": "https://console.aws.amazon.com/cost-management/home#",
+                            "action_id": "button-action"
+                        }
+                    }
+                ],
                 "attachments": [
                     {
                         "mrkdwn_in": ["text"],
@@ -138,6 +176,40 @@ class CostExplorerQuery:
             logger.exception(error)
 
     @staticmethod
+    def group_by_account(granularity):
+        try:
+            # Init Cost Explorer
+            client = boto3.client('ce')
+            # type check and init start time
+            if granularity == "DAILY": 
+                start_time = YESTERDAY.strftime('%Y-%m-%d')
+            elif granularity == "MONTHLY":
+                start_time = FIRSTDAY_OF_MONTH.strftime('%Y-%m-%d')
+            else:
+                raise Exception("granularity should be 'DAILY' or 'MONTHLY'")
+            # Cost and usage report's query statement
+            query = {
+                "TimePeriod": {
+                    "Start": start_time,
+                    "End": TODAY.strftime('%Y-%m-%d'),
+                },
+                "Granularity": granularity,
+                "Metrics": ["UnblendedCost"],
+                "GroupBy": [
+                    {
+                        "Type": "DIMENSION",
+                        "Key": "LINKED_ACCOUNT",
+                    },
+                ],
+            }
+            # create report and return it
+            return client.get_cost_and_usage(**query)
+        except Exception as error:
+            logger.info("Failed CostExplorer Query group by account.")
+            logger.exception(error)
+
+
+    @staticmethod
     def total(granularity):
         try:
             # Init Cost Explorer
@@ -155,11 +227,27 @@ class CostExplorerQuery:
                     "Start": start_time,
                     "End": TODAY.strftime('%Y-%m-%d'),
                 },
-                "Granularity": "DAILY",
+                "Granularity": granularity,
                 "Metrics": ["UnblendedCost"],
             }
             # create report and return it
             return client.get_cost_and_usage(**query)
         except Exception as error:
             logger.info("Failed CostExplorer Query total.")
+            logger.exception(error)
+
+
+class Organizations:
+
+    @staticmethod
+    def list_accounts():
+        try:
+            client = boto3.client('organizations')
+            response = client.list_accounts()
+            return {
+                account["Id"]: account["Email"]
+                for account in response["Accounts"]
+            }
+        except Exception as error:
+            logger.info("Failed Organizations list accounts.")
             logger.exception(error)
